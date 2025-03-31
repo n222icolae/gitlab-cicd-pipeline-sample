@@ -1,0 +1,128 @@
+stages:
+  - build
+  - test
+  - scan
+  - migrate
+  - deploy_staging
+  - deploy_prod
+
+build:
+  stage: build
+  image: docker:stable
+  services:
+    - docker:dind
+  variables:
+    DOCKER_IMAGE_NAME: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - docker build --pull -t "$DOCKER_IMAGE_NAME" .
+    - docker push "$DOCKER_IMAGE_NAME"
+    - |
+      if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then
+        docker tag "$DOCKER_IMAGE_NAME" "$CI_REGISTRY_IMAGE:latest"
+        docker push "$CI_REGISTRY_IMAGE:latest"
+      fi
+
+test:
+  stage: test
+  image: docker:stable
+  script:
+    - echo "Running tests..."
+  needs:
+    - build
+
+scan:
+  stage: scan
+  image: docker:stable
+  services:
+    - name: docker:dind
+      entrypoint: ["env", "-u", "DOCKER_HOST"]
+      command: ["dockerd-entrypoint.sh"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_DRIVER: overlay2
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_IMAGE_NAME: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker pull "$DOCKER_IMAGE_NAME"
+    - export TRIVY_VERSION=$(wget -qO - "https://api.github.com/repos/aquasecurity/trivy/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+    - echo $TRIVY_VERSION
+    - wget --no-verbose https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz -O - | tar -zxvf -
+  script:
+    # Build report
+    - ./trivy image "$DOCKER_IMAGE_NAME" --exit-code 0 --cache-dir .trivycache/ --format template --template "@contrib/gitlab.tpl" -o gl-container-scanning-report.json
+    # Print report
+    - ./trivy image "$DOCKER_IMAGE_NAME" --exit-code 0 --cache-dir .trivycache/ --no-progress --severity HIGH
+    # Fail on CRITICAL vulnerabilities
+    - ./trivy image "$DOCKER_IMAGE_NAME" --exit-code 1 --cache-dir .trivycache/ --severity CRITICAL --no-progress
+  cache:
+    paths:
+      - .trivycache/
+  artifacts:
+    reports:
+      container_scanning: gl-container-scanning-report.json
+  needs:
+    - build
+
+migrate:
+  stage: migrate
+  image: docker:stable
+  variables:
+    GCP_PROJECT_NUMBER: 000000000000 # change this value to match yours
+    GCP_WORKLOAD_IDENTITY_FEDERATION_POOL_ID: gitlab-pool # change this value to match yours
+    GCP_WORKLOAD_IDENTITY_FEDERATION_PROVIDER_ID: gitlab-identity-provider # change this value to match yours
+    DB_HOST: "localhost"
+    DB_NAME: "postgres"
+    DB_USER: "admin"
+  id_tokens:
+    GCP_ID_TOKEN:
+      aud: https://iam.googleapis.com/projects/${GCP_PROJECT_NUMBER}/locations/global/workloadIdentityPools/${GCP_WORKLOAD_IDENTITY_FEDERATION_POOL_ID}/providers/${GCP_WORKLOAD_IDENTITY_FEDERATION_PROVIDER_ID}
+  secrets:
+    DB_PASSWORD:
+      gcp_secret_manager:
+        name: projects/${GCP_PROJECT_NUMBER}/secrets/db-password
+      token: $GCP_ID_TOKEN
+  script:
+    - echo "Running PostgreSQL migrations..."
+#    - flyway -url="jdbc:postgresql://$DB_HOST/$DB_NAME" -user="$DB_USER" -password="$DB_PASSWORD" migrate
+  needs:
+    - scan
+
+deploy_staging:
+  stage: deploy_staging
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [ '' ]
+  variables:
+    DOCKER_IMAGE_NAME: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+    ENV: "staging"
+    NAMESPACE: "app-staging"
+  script:
+    - echo "Deploying to env=$ENV image=$DOCKER_IMAGE_NAME"
+#    - kubectl set image deployment/hello-world hello-world=$DOCKER_IMAGE_NAME -n $NAMESPACE
+#    - kubectl rollout status deployment/hello-world -n $NAMESPACE --timeout=60s
+  needs:
+    - migrate
+  except:
+    - main
+
+deploy_prod:
+  stage: deploy_prod
+  image:
+    name: bitnami/kubectl:latest
+    entrypoint: [ '' ]
+  variables:
+    DOCKER_IMAGE_NAME: "$CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG"
+    ENV: "prod"
+    NAMESPACE: "app-prod"
+  script:
+    - echo "Deploying to env=$ENV image=$DOCKER_IMAGE_NAME"
+#    - kubectl set image deployment/hello-world hello-world=$DOCKER_IMAGE_NAME -n $NAMESPACE
+#    - kubectl rollout status deployment/hello-world -n $NAMESPACE --timeout=60s
+  when: manual
+  needs:
+    - migrate
+  only:
+    - main
